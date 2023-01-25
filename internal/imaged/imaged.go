@@ -2,9 +2,11 @@ package imaged
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -12,7 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gokrazy/internal/gpt"
 	"github.com/google/renameio/v2"
+	"github.com/klauspost/pgzip"
 	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 )
@@ -68,10 +72,106 @@ func listenAndServe(ctx context.Context, srv *http.Server) error {
 
 type server struct {
 	ingestDir string
+
+	// getUsedBytes takes the path to an image and returns the number of bytes
+	// that are actually used (by the MBR/GPT and rootA partition).
+	getUsedBytes func(imagePath string) (int64, error)
 }
 
 func (s *server) index(w http.ResponseWriter, r *http.Request) error {
-	// TODO: redirect to imaged repository README on GitHub
+	http.Redirect(w, r, "https://github.com/gokrazy/imaged", http.StatusFound)
+	return nil
+}
+
+func (s *server) validBase(base string) error {
+	// Instead of trying to strip base of path traversal attacks, we just list
+	// the directory and only continue if we find a file that matches base.
+	ents, err := os.ReadDir(s.ingestDir)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	found := slices.ContainsFunc(ents, func(ent os.DirEntry) bool {
+		return ent.Name() == base
+	})
+	if !found {
+		return httpError(http.StatusNotFound, fmt.Errorf("this directory is not configured for ingestion on this server yet"))
+	}
+	return nil
+}
+
+func (s *server) customize(w http.ResponseWriter, r *http.Request) error {
+	// TODO: actually parse accept-encoding header
+	// TODO: add support for zstd, add a benchmark to see in which order to negotiate
+	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		// TODO: behind a flag, allow uncompressed downloads (resulting in much
+		// higher bandwidth usage)
+		return httpError(http.StatusBadRequest, fmt.Errorf("your browser does not support transparent compression (Accept-Encoding: gzip)"))
+	}
+
+	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/customize/")
+	parts := strings.Split(rest, "/")
+	if len(parts) < 3 {
+		return httpError(http.StatusNotFound, fmt.Errorf("syntax: /api/v1/customize/<base>/<image>/<file>"))
+	}
+	base, imageDir, filename := parts[0], parts[1], parts[2]
+	if err := s.validBase(base); err != nil {
+		return err
+	}
+	path := filepath.Join(s.ingestDir, base, imageDir, filename)
+	// The filename should be requested without the .gz suffix, but the ingested
+	// file is always stored as .gz file on disk.
+	if !strings.HasSuffix(path, ".gz") {
+		path += ".gz"
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	used, err := s.getUsedBytes(path)
+	if err != nil {
+		return err
+	}
+
+	zr, err := pgzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+
+	wr := pgzip.NewWriter(w)
+	defer wr.Close()
+	w.Header().Set("Content-Encoding", "gzip")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+
+	// Copy the start of the image as it is.
+	start := &io.LimitedReader{R: zr, N: used}
+	if _, err := io.Copy(wr, start); err != nil {
+		return err
+	}
+
+	// Inject the extra configuration in the unused space.
+	injected := strings.NewReader("HELLO WORLD")
+	n, err := io.Copy(wr, injected)
+	if err != nil {
+		return err
+	}
+	// Skip the corresponding number of bytes in the original image.
+	if _, err := io.Copy(ioutil.Discard, &io.LimitedReader{R: zr, N: n}); err != nil {
+		return err
+	}
+
+	// Copy the rest of the image.
+	if _, err := io.Copy(wr, zr); err != nil {
+		return err
+	}
+
+	if err := wr.Close(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -90,17 +190,8 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	base := strings.TrimPrefix(r.URL.Path, "/api/v1/ingest/")
-	// Instead of trying to strip base of path traversal attacks, we just list
-	// the directory and only continue if we find a file that matches base.
-	ents, err := os.ReadDir(s.ingestDir)
-	if err != nil && !os.IsNotExist(err) {
+	if err := s.validBase(base); err != nil {
 		return err
-	}
-	found := slices.ContainsFunc(ents, func(ent os.DirEntry) bool {
-		return ent.Name() == base
-	})
-	if !found {
-		return httpError(http.StatusNotFound, fmt.Errorf("this directory is not configured for ingestion on this server yet"))
 	}
 
 	dir, err := os.MkdirTemp(filepath.Join(s.ingestDir, base), "image-")
@@ -108,7 +199,8 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	f, err := renameio.NewPendingFile(filepath.Join(dir, "full.img.gz"))
+	filename := "full.img.gz"
+	f, err := renameio.NewPendingFile(filepath.Join(dir, filename))
 	if err != nil {
 		return err
 	}
@@ -124,7 +216,43 @@ func (s *server) ingest(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	return nil
+	// TODO: can we rename full.img.gz to <base>_<build>.img by extracting the
+	// build id from the image?
+
+	b, err := json.Marshal(struct {
+		CustomizeURL string
+	}{
+		CustomizeURL: "/api/v1/customize/" + base + "/" + filepath.Base(dir) + "/" + strings.TrimSuffix(filename, ".gz"),
+	})
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, err = w.Write(b)
+	return err
+}
+
+func getUsedBytesFromGPT(imagePath string) (int64, error) {
+	f, err := os.Open(imagePath)
+	if err != nil {
+		return -1, err
+	}
+	defer f.Close()
+	zr, err := pgzip.NewReader(f)
+	if err != nil {
+		return -1, err
+	}
+	defer zr.Close()
+	// TODO: fall back to BIOS in case no GPT is present (odroid hc2 images)
+	parts, err := gpt.PartitionEntries(zr)
+	if err != nil {
+		return -1, err
+	}
+	// boot is parts[0]
+	// rootA is parts[1]
+	rootB := parts[2]
+	byteOffset := int64(rootB.FirstLBA) * 512
+	return byteOffset, nil
 }
 
 func Main() error {
@@ -141,12 +269,14 @@ func Main() error {
 	flag.Parse()
 
 	srv := &server{
-		ingestDir: *ingestDir,
+		ingestDir:    *ingestDir,
+		getUsedBytes: getUsedBytesFromGPT,
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", handleError(srv.index))
 	mux.Handle("/api/v1/ingest/", handleError(srv.ingest))
+	mux.Handle("/api/v1/customize/", handleError(srv.customize))
 
 	eg, ctx := errgroup.WithContext(context.Background())
 	for _, addr := range strings.Split(*listenAddrs, ",") {
